@@ -88,6 +88,13 @@ export interface ComposeInput {
     | undefined;
   designSystemBody?: string | undefined;
   designSystemTitle?: string | undefined;
+  // Craft references the active skill opted into via `od.craft.requires`.
+  // The daemon resolves the slug list to file contents and concatenates
+  // them with section headers; we inject them between the DESIGN.md and
+  // the skill body so brand tokens win on conflict but craft rules
+  // (letter-spacing, accent caps, anti-slop) cover everything below.
+  craftBody?: string | undefined;
+  craftSections?: string[] | undefined;
   // Project-level metadata captured by the new-project panel. Drives the
   // agent's understanding of artifact kind, fidelity, speaker-notes intent
   // and animation intent. Missing fields here are exactly what the
@@ -105,6 +112,8 @@ export function composeSystemPrompt({
   skillMode,
   designSystemBody,
   designSystemTitle,
+  craftBody,
+  craftSections,
   metadata,
   template,
 }: ComposeInput): string {
@@ -121,6 +130,16 @@ export function composeSystemPrompt({
   if (designSystemBody && designSystemBody.trim().length > 0) {
     parts.push(
       `\n\n## Active design system${designSystemTitle ? ` — ${designSystemTitle}` : ''}\n\nTreat the following DESIGN.md as authoritative for color, typography, spacing, and component rules. Do not invent tokens outside this palette. When you copy the active skill's seed template, bind these tokens into its \`:root\` block before generating any layout.\n\n${designSystemBody.trim()}`,
+    );
+  }
+
+  if (craftBody && craftBody.trim().length > 0) {
+    const sectionLabel =
+      Array.isArray(craftSections) && craftSections.length > 0
+        ? ` — ${craftSections.join(', ')}`
+        : '';
+    parts.push(
+      `\n\n## Active craft references${sectionLabel}\n\nThe following craft rules are universal — they apply on top of the active design system above, regardless of brand. The DESIGN.md decides *which* tokens to use; craft rules decide *how* to use them. On any conflict between a craft rule and a brand DESIGN.md, the brand wins for token values; craft rules still apply to anything the brand does not override (letter-spacing, accent overuse caps, anti-slop patterns).\n\n${craftBody.trim()}`,
     );
   }
 

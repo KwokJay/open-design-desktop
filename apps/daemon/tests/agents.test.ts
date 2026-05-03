@@ -1,19 +1,39 @@
 // @ts-nocheck
 import { afterEach, test } from 'vitest';
 import assert from 'node:assert/strict';
-import { AGENT_DEFS } from '../src/agents.js';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { AGENT_DEFS, resolveAgentExecutable } from '../src/agents.js';
 
 const codex = AGENT_DEFS.find((agent) => agent.id === 'codex');
+const copilot = AGENT_DEFS.find((agent) => agent.id === 'copilot');
 const cursorAgent = AGENT_DEFS.find((agent) => agent.id === 'cursor-agent');
 const kiro = AGENT_DEFS.find((agent) => agent.id === 'kiro');
+const vibe = AGENT_DEFS.find((agent) => agent.id === 'vibe');
 const claude = AGENT_DEFS.find((agent) => agent.id === 'claude');
+const devin = AGENT_DEFS.find((agent) => agent.id === 'devin');
 const originalDisablePlugins = process.env.OD_CODEX_DISABLE_PLUGINS;
+const originalPath = process.env.PATH;
+const originalHome = process.env.HOME;
+const originalAgentHome = process.env.OD_AGENT_HOME;
 
 afterEach(() => {
   if (originalDisablePlugins == null) {
     delete process.env.OD_CODEX_DISABLE_PLUGINS;
   } else {
     process.env.OD_CODEX_DISABLE_PLUGINS = originalDisablePlugins;
+  }
+  process.env.PATH = originalPath;
+  if (originalHome == null) {
+    delete process.env.HOME;
+  } else {
+    process.env.HOME = originalHome;
+  }
+  if (originalAgentHome == null) {
+    delete process.env.OD_AGENT_HOME;
+  } else {
+    process.env.OD_AGENT_HOME = originalAgentHome;
   }
 });
 
@@ -32,7 +52,6 @@ test('codex args disable plugins when OD_CODEX_DISABLE_PLUGINS is 1', () => {
     '--disable',
     'plugins',
   ]);
-  assert.equal(args.at(-1), '-');
 });
 
 test('codex args keep plugins enabled when OD_CODEX_DISABLE_PLUGINS is unset', () => {
@@ -42,7 +61,6 @@ test('codex args keep plugins enabled when OD_CODEX_DISABLE_PLUGINS is unset', (
 
   assert.equal(args.includes('--disable'), false);
   assert.equal(args.includes('plugins'), false);
-  assert.equal(args.at(-1), '-');
 });
 
 test('codex args keep plugins enabled when OD_CODEX_DISABLE_PLUGINS is not 1', () => {
@@ -52,7 +70,27 @@ test('codex args keep plugins enabled when OD_CODEX_DISABLE_PLUGINS is not 1', (
 
   assert.equal(args.includes('--disable'), false);
   assert.equal(args.includes('plugins'), false);
-  assert.equal(args.at(-1), '-');
+});
+
+// Recent Codex CLI versions reject a bare `-` argv sentinel; passing it
+// alongside the stdin pipe causes `error: unexpected argument '-' found`
+// and exit code 2 before any prompt is read. We deliver the prompt via
+// stdin pipe alone (gated by `promptViaStdin: true`). Regression of #237.
+test('codex args do not include the literal `-` stdin sentinel (regression of #237)', () => {
+  delete process.env.OD_CODEX_DISABLE_PLUGINS;
+
+  const baseArgs = codex.buildArgs('', [], [], {}, { cwd: '/tmp/od-project' });
+  assert.equal(baseArgs.includes('-'), false);
+
+  const withModel = codex.buildArgs('', [], [], { model: 'gpt-5-codex' }, { cwd: '/tmp/od-project' });
+  assert.equal(withModel.includes('-'), false);
+
+  const withReasoning = codex.buildArgs('', [], [], { reasoning: 'high' }, { cwd: '/tmp/od-project' });
+  assert.equal(withReasoning.includes('-'), false);
+
+  process.env.OD_CODEX_DISABLE_PLUGINS = '1';
+  const withDisablePlugins = codex.buildArgs('', [], [], {}, { cwd: '/tmp/od-project' });
+  assert.equal(withDisablePlugins.includes('-'), false);
 });
 
 test('cursor-agent args deliver prompts via stdin without passing a literal dash prompt', () => {
@@ -70,11 +108,79 @@ test('cursor-agent args deliver prompts via stdin without passing a literal dash
   ]);
 });
 
+// `-p -` puts Copilot in prompt mode and tells it to read the body from
+// stdin. Without this pair the daemon writes the prompt to the child's
+// stdin pipe (because `promptViaStdin: true`) but Copilot stays
+// interactive, ignores stdin, and rejects the run with
+// `error: too many arguments. Expected 0 arguments but got N`. Pin the
+// pair as the leading argv elements so the regression in #350 can't
+// drift back. Also pin the order — Copilot expects `-p` before any other
+// flag, including model / add-dir extensions.
+test('copilot args lead with `-p -` so the stdin prompt is actually consumed (regression of #350)', () => {
+  const baseArgs = copilot.buildArgs('', [], [], {});
+  assert.equal(baseArgs[0], '-p');
+  assert.equal(baseArgs[1], '-');
+  assert.deepEqual(baseArgs, [
+    '-p',
+    '-',
+    '--allow-all-tools',
+    '--output-format',
+    'json',
+  ]);
+});
+
+test('copilot args keep `-p -` at the front when model and extra dirs are added', () => {
+  const args = copilot.buildArgs(
+    '',
+    [],
+    ['/tmp/od-skills', '/tmp/od-design-systems'],
+    { model: 'claude-sonnet-4.6' },
+  );
+  assert.equal(args[0], '-p');
+  assert.equal(args[1], '-');
+  assert.deepEqual(args, [
+    '-p',
+    '-',
+    '--allow-all-tools',
+    '--output-format',
+    'json',
+    '--model',
+    'claude-sonnet-4.6',
+    '--add-dir',
+    '/tmp/od-skills',
+    '--add-dir',
+    '/tmp/od-design-systems',
+  ]);
+});
+
+test('copilot drops empty / non-string entries from extraAllowedDirs without breaking the `-p -` lead', () => {
+  const args = copilot.buildArgs('', [], ['', null, '/tmp/od-skills', undefined], {});
+  assert.equal(args[0], '-p');
+  assert.equal(args[1], '-');
+  // Only the one valid path survives.
+  const addDirIndex = args.indexOf('--add-dir');
+  assert.equal(args[addDirIndex + 1], '/tmp/od-skills');
+  assert.equal(args.filter((a) => a === '--add-dir').length, 1);
+});
+
 test('kiro args use acp subcommand for json-rpc streaming', () => {
   const args = kiro.buildArgs('', [], [], {});
 
   assert.deepEqual(args, ['acp']);
   assert.equal(kiro.streamFormat, 'acp-json-rpc');
+});
+
+test('devin args use acp subcommand for json-rpc streaming', () => {
+  const args = devin.buildArgs('', [], [], {});
+
+  assert.deepEqual(args, [
+    '--permission-mode',
+    'dangerous',
+    '--respect-workspace-trust',
+    'false',
+    'acp',
+  ]);
+  assert.equal(devin.streamFormat, 'acp-json-rpc');
 });
 
 test('kiro fetchModels falls back to fallbackModels when detection fails', async () => {
@@ -160,4 +266,138 @@ test('claude flags promptViaStdin and never embeds the prompt in argv', () => {
   // `-p` (print mode) must still be present; without it claude drops into
   // an interactive REPL that the daemon has no TTY for.
   assert.ok(args.includes('-p'), 'claude argv must include -p');
+});
+
+// ---- OpenClaude fallback (issue #235) -------------------------------------
+// OpenClaude (https://github.com/Gitlawb/openclaude) is a Claude Code fork
+// that ships under a different binary name but speaks an argv-compatible
+// CLI. Users with only `openclaude` on PATH should be auto-detected as the
+// Claude Code agent without writing a wrapper script. The mechanism is the
+// `fallbackBins` array on the Claude AGENT_DEF, consumed by
+// `resolveAgentExecutable`.
+
+test('claude entry declares openclaude as a fallback bin (issue #235)', () => {
+  assert.ok(
+    Array.isArray(claude.fallbackBins),
+    'claude.fallbackBins must be an array',
+  );
+  assert.ok(
+    claude.fallbackBins.includes('openclaude'),
+    `claude.fallbackBins must include 'openclaude'; got ${JSON.stringify(claude.fallbackBins)}`,
+  );
+});
+
+// resolveAgentExecutable touches the filesystem via existsSync; on
+// Windows resolveOnPath also walks PATHEXT extensions, which our fixture
+// files don't carry. Skip the filesystem-backed cases there — the
+// declarative `fallbackBins`-on-claude assertion above still runs on
+// every platform and is what catches regressions in the AGENT_DEF.
+const fsTest = process.platform === 'win32' ? test.skip : test;
+
+fsTest('resolveAgentExecutable prefers def.bin over fallbackBins when bin is on PATH', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'od-agents-resolve-'));
+  try {
+    writeFileSync(join(dir, 'claude'), '');
+    writeFileSync(join(dir, 'openclaude'), '');
+    chmodSync(join(dir, 'claude'), 0o755);
+    chmodSync(join(dir, 'openclaude'), 0o755);
+    process.env.OD_AGENT_HOME = dir;
+    process.env.PATH = dir;
+
+    const resolved = resolveAgentExecutable({
+      bin: 'claude',
+      fallbackBins: ['openclaude'],
+    });
+    assert.equal(resolved, join(dir, 'claude'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+fsTest('resolveAgentExecutable falls back through fallbackBins when def.bin is missing', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'od-agents-resolve-'));
+  try {
+    // Only `openclaude` is installed (Claude Code fork-only setup).
+    writeFileSync(join(dir, 'openclaude'), '');
+    chmodSync(join(dir, 'openclaude'), 0o755);
+    process.env.OD_AGENT_HOME = dir;
+    process.env.PATH = dir;
+
+    const resolved = resolveAgentExecutable({
+      bin: 'claude',
+      fallbackBins: ['openclaude'],
+    });
+    assert.equal(resolved, join(dir, 'openclaude'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+fsTest('resolveAgentExecutable returns null when neither def.bin nor any fallback is on PATH', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'od-agents-resolve-'));
+  try {
+    process.env.OD_AGENT_HOME = dir;
+    process.env.PATH = dir;
+
+    const resolved = resolveAgentExecutable({
+      bin: 'claude',
+      fallbackBins: ['openclaude'],
+    });
+    assert.equal(resolved, null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+fsTest('resolveAgentExecutable searches mise node bins when PATH is minimal', () => {
+  const home = mkdtempSync(join(tmpdir(), 'od-agents-home-'));
+  try {
+    const dir = join(home, '.local', 'share', 'mise', 'installs', 'node', '24.14.1', 'bin');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'codex'), '');
+    chmodSync(join(dir, 'codex'), 0o755);
+    process.env.OD_AGENT_HOME = home;
+    process.env.PATH = '/usr/bin:/bin';
+
+    const resolved = resolveAgentExecutable({
+      bin: 'codex',
+    });
+    assert.equal(resolved, join(dir, 'codex'));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+fsTest('resolveAgentExecutable still resolves agents without a fallbackBins field', () => {
+  // Guard against a regression that would require every AGENT_DEF to
+  // declare fallbackBins. Most agents (codex / gemini / opencode / ...)
+  // only have a single binary name and must keep working unchanged.
+  const dir = mkdtempSync(join(tmpdir(), 'od-agents-resolve-'));
+  try {
+    writeFileSync(join(dir, 'codex'), '');
+    chmodSync(join(dir, 'codex'), 0o755);
+    process.env.PATH = dir;
+
+    const resolved = resolveAgentExecutable({ bin: 'codex' });
+    assert.equal(resolved, join(dir, 'codex'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('vibe args use empty array for acp-json-rpc streaming', () => {
+  const args = vibe.buildArgs('', [], [], {});
+
+  assert.deepEqual(args, []);
+  assert.equal(vibe.streamFormat, 'acp-json-rpc');
+});
+
+test('vibe fetchModels falls back to fallbackModels when detection fails', async () => {
+  // fetchModels rejects when the binary doesn't exist; the daemon's
+  // probe() catches this and uses fallbackModels instead.
+  const result = await vibe.fetchModels('/nonexistent/vibe-acp').catch(() => null);
+
+  assert.equal(result, null);
+  assert.ok(Array.isArray(vibe.fallbackModels));
+  assert.equal(vibe.fallbackModels[0].id, 'default');
 });

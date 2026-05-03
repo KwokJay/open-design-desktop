@@ -198,6 +198,42 @@ function showWindowButtons(window: BrowserWindow): void {
   window.setWindowButtonVisibility(true);
 }
 
+// Windows focus-stealing prevention can leave a detached-spawned GUI
+// window minimized or hidden even when constructed with show:true,
+// leaving users unable to locate the window. Cross-platform safe: only
+// acts when the window is actually minimized or hidden, preserving any
+// user-adjusted window state.
+function ensureWindowVisible(window: BrowserWindow): void {
+  if (window.isDestroyed()) return;
+  if (window.isMinimized()) window.restore();
+  if (!window.isVisible()) window.show();
+  window.focus();
+}
+
+// PPTX is rendered by the agent into the project folder and reaches the
+// renderer through a normal `<a download>` link to /api/projects/:id/raw/*.
+// Without this hook Electron writes the bytes straight to the OS Downloads
+// folder, so the user never gets to pick a destination. setSaveDialogOptions
+// makes Electron show the native Save As panel before the download starts.
+const SAVE_AS_EXTENSIONS = new Set([".pptx"]);
+
+function attachDownloadSaveAsDialog(window: BrowserWindow): void {
+  window.webContents.session.on("will-download", (_event, item) => {
+    const filename = item.getFilename();
+    const dot = filename.lastIndexOf(".");
+    const ext = dot >= 0 ? filename.slice(dot).toLowerCase() : "";
+    if (!SAVE_AS_EXTENSIONS.has(ext)) return;
+    item.setSaveDialogOptions({
+      title: "Save As",
+      defaultPath: filename,
+      filters: [
+        { name: "PowerPoint Presentation", extensions: ["pptx"] },
+        { name: "All Files", extensions: ["*"] },
+      ],
+    });
+  });
+}
+
 export async function createDesktopRuntime(options: DesktopRuntimeOptions): Promise<DesktopRuntime> {
   const consoleEntries: DesktopConsoleEntry[] = [];
   const store = await readStore();
@@ -224,6 +260,7 @@ export async function createDesktopRuntime(options: DesktopRuntimeOptions): Prom
 
   installWindowChromeCssHook(window);
   showWindowButtons(window);
+  attachDownloadSaveAsDialog(window);
 
   // Inject desktop flag so the web app can detect the desktop environment.
   window.webContents.on("dom-ready", () => {
@@ -266,7 +303,6 @@ export async function createDesktopRuntime(options: DesktopRuntimeOptions): Prom
   }).catch((error: unknown) => {
     console.error("desktop tray setup failed", error);
   });
-
   let currentUrl: string | null = null;
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
@@ -288,7 +324,7 @@ export async function createDesktopRuntime(options: DesktopRuntimeOptions): Prom
 
   await window.loadURL(createPendingHtml());
   showWindowButtons(window);
-  window.show();
+  ensureWindowVisible(window);
 
   const schedule = (delayMs: number) => {
     if (stopped) return;

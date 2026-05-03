@@ -31,6 +31,10 @@ const allowedExactPaths = new Set([
   "scripts/import-prompt-templates.mjs",
   "scripts/postinstall.mjs",
   "apps/packaged/esbuild.config.mjs",
+  // Browser service workers must be served as JavaScript files.
+  "apps/web/public/od-notifications-sw.js",
+  "scripts/bake-html-ppt-examples.mjs",
+  "scripts/scaffold-html-ppt-skills.mjs",
   "scripts/sync-hyperframes-skill.mjs",
   "scripts/verify-media-models.mjs",
   "tools/dev/bin/tools-dev.mjs",
@@ -51,6 +55,8 @@ const allowedPathPrefixes = [
   "e2e/reports/test-results/",
   // Vendored upstream HyperFrames skill helper scripts.
   "skills/hyperframes/scripts/",
+  // Vendored upstream html-ppt skill runtime assets (lewislulu/html-ppt-skill).
+  "skills/html-ppt/assets/",
   "test-results/",
   "vendor/",
 ];

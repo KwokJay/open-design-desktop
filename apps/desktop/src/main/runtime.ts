@@ -3,6 +3,11 @@ import { dirname, isAbsolute, resolve } from "node:path";
 
 import { BrowserWindow } from "electron";
 
+import { createApplicationMenu } from "./menu.js";
+import { registerDesktopShortcuts, type DesktopShortcuts } from "./shortcuts.js";
+import { createDesktopTray, type DesktopTray } from "./tray.js";
+import { readStore, writeStore, type WindowState } from "./store.js";
+
 const PENDING_POLL_MS = 120;
 const RUNNING_POLL_MS = 2000;
 const MAX_CONSOLE_ENTRIES = 200;
@@ -65,6 +70,31 @@ export type DesktopRuntime = {
 export type DesktopRuntimeOptions = {
   discoverUrl(): Promise<string | null>;
 };
+
+const DEFAULT_WINDOW_WIDTH = 1280;
+const DEFAULT_WINDOW_HEIGHT = 900;
+
+function sanitizeWindowState(state: WindowState | undefined): WindowState {
+  const width = state?.width ?? DEFAULT_WINDOW_WIDTH;
+  const height = state?.height ?? DEFAULT_WINDOW_HEIGHT;
+  return {
+    height: Math.max(400, Math.min(height, 4096)),
+    width: Math.max(600, Math.min(width, 4096)),
+    ...(state?.x != null ? { x: state.x } : {}),
+    ...(state?.y != null ? { y: state.y } : {}),
+  };
+}
+
+function injectDesktopFlagScript(): string {
+  return `(() => {
+    Object.defineProperty(window, "__IS_DESKTOP__", {
+      value: true,
+      writable: false,
+      configurable: false,
+      enumerable: false,
+    });
+  })();`;
+}
 
 const MAC_WINDOW_CHROME =
   process.platform === "darwin"
@@ -170,20 +200,73 @@ function showWindowButtons(window: BrowserWindow): void {
 
 export async function createDesktopRuntime(options: DesktopRuntimeOptions): Promise<DesktopRuntime> {
   const consoleEntries: DesktopConsoleEntry[] = [];
+  const store = await readStore();
+  const windowState = sanitizeWindowState(store.windowState);
+
   const window = new BrowserWindow({
-    height: 900,
-    show: true,
+    height: windowState.height,
+    show: false,
     title: "Open Design",
+    width: windowState.width,
+    x: windowState.x,
+    y: windowState.y,
     ...MAC_WINDOW_CHROME,
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
     },
-    width: 1280,
   });
+
+  if (store.windowMaximized) {
+    window.maximize();
+  }
+
   installWindowChromeCssHook(window);
   showWindowButtons(window);
+
+  // Inject desktop flag so the web app can detect the desktop environment.
+  window.webContents.on("dom-ready", () => {
+    if (!window.isDestroyed()) {
+      window.webContents.executeJavaScript(injectDesktopFlagScript(), true).catch(() => undefined);
+    }
+  });
+
+  // Persist window state on close
+  let willClose = false;
+  window.on("close", async () => {
+    if (willClose) return;
+    willClose = true;
+    try {
+      const bounds = window.getBounds();
+      await writeStore({
+        windowMaximized: window.isMaximized(),
+        windowState: {
+          height: bounds.height,
+          width: bounds.width,
+          x: bounds.x,
+          y: bounds.y,
+        },
+      });
+    } catch (error) {
+      console.error("desktop failed to persist window state", error);
+    }
+  });
+
+  // Set up application menu
+  createApplicationMenu(window);
+
+  // Register global shortcuts
+  const shortcuts: DesktopShortcuts = registerDesktopShortcuts(window);
+
+  // Set up system tray (async; allowed to fail gracefully)
+  let tray: DesktopTray | null = null;
+  createDesktopTray(window).then((t) => {
+    tray = t;
+  }).catch((error: unknown) => {
+    console.error("desktop tray setup failed", error);
+  });
+
   let currentUrl: string | null = null;
   let stopped = false;
   let timer: NodeJS.Timeout | null = null;
@@ -205,6 +288,7 @@ export async function createDesktopRuntime(options: DesktopRuntimeOptions): Prom
 
   await window.loadURL(createPendingHtml());
   showWindowButtons(window);
+  window.show();
 
   const schedule = (delayMs: number) => {
     if (stopped) return;
@@ -248,6 +332,8 @@ export async function createDesktopRuntime(options: DesktopRuntimeOptions): Prom
     },
     async close() {
       stopped = true;
+      shortcuts.unregister();
+      tray?.destroy();
       if (timer != null) {
         clearTimeout(timer);
         timer = null;

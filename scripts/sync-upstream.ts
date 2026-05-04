@@ -193,6 +193,22 @@ function main(): SyncResult {
   run(["git", "commit", "-m", mergeCommitMsg]);
   console.log(`[sync] merge committed: ${mergeCommitMsg}`);
 
+  // Install dependencies if lockfile changed
+  const lockChanged = runQuiet(["git", "diff", "--name-only", "HEAD~1"]).stdout;
+  if (lockChanged.includes("pnpm-lock.yaml") || lockChanged.includes("package.json")) {
+    console.log("[sync] dependency changes detected, running pnpm install...");
+    const install = spawnSync("pnpm", ["install"], {
+      encoding: "utf8",
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    if (install.status !== 0) {
+      console.error("[sync] pnpm install failed.");
+      console.error((install.stderr ?? "").slice(-2000));
+      return { kind: "typecheck-failed", output: install.stderr ?? "" };
+    }
+  }
+
   // Validate
   const typecheck = runTypecheck();
   if (!typecheck.ok) {

@@ -4,28 +4,43 @@
  *
  * Usage:
  *   node --experimental-strip-types scripts/sync-upstream.ts
- *   tsx scripts/sync-upstream.ts
+ *   SYNC_UPSTREAM_PUSH=1 node --experimental-strip-types scripts/sync-upstream.ts
  *
- * Behavior:
- * 1. Ensures the upstream remote exists.
- * 2. Fetches upstream/main.
- * 3. Compares upstream/main with the current branch.
- * 4. If upstream is ahead, merges the changes.
- * 5. On merge conflict: aborts and reports the conflicted files.
- * 6. On clean merge: runs `pnpm typecheck` to validate.
- * 7. If typecheck passes: optionally pushes to origin.
+ * Safety guarantees:
+ * 1. Aborts immediately if the working tree is dirty.
+ * 2. Shows local-only commits before merging so you can verify nothing
+ *    important will be overwritten.
+ * 3. On merge conflict: aborts the merge and exits — never resolves
+ *    conflicts automatically.
+ * 4. After a clean merge: verifies protected files still exist, runs
+ *    pnpm install when lockfile changed, then runs pnpm typecheck.
+ * 5. Only pushes after all validations pass.
  */
 
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 
 const UPSTREAM_URL = "https://github.com/nexu-io/open-design.git";
 const UPSTREAM_BRANCH = "upstream/main";
 
+/** Files that must not be deleted by an upstream merge. */
+const PROTECTED_FILES = [
+  "scripts/sync-upstream.ts",
+  "apps/desktop/src/main/menu.ts",
+  "apps/desktop/src/main/tray.ts",
+  "apps/desktop/src/main/shortcuts.ts",
+  "apps/desktop/src/main/store.ts",
+];
+
 type SyncResult =
   | { kind: "no-updates" }
+  | { kind: "dirty-worktree" }
   | { kind: "conflict"; files: string[] }
+  | { kind: "protected-file-missing"; files: string[] }
   | { kind: "typecheck-failed"; output: string }
+  | { kind: "install-failed"; output: string }
   | { kind: "success"; commits: number };
+
+/* ─── shell helpers ─── */
 
 function run(args: string[], cwd?: string): string {
   const result = spawnSync(args[0]!, args.slice(1), {
@@ -60,6 +75,8 @@ function runQuiet(args: string[], cwd?: string): { ok: boolean; stdout: string; 
   };
 }
 
+/* ─── git helpers ─── */
+
 function getCurrentBranch(): string {
   return run(["git", "rev-parse", "--abbrev-ref", "HEAD"]);
 }
@@ -90,34 +107,77 @@ function getCommitCountDiff(base: string, target: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function mergeUpstream(targetBranch: string): boolean {
-  console.log(`[sync] merging ${UPSTREAM_BRANCH} into ${targetBranch}...`);
-  const result = runQuiet([
-    "git",
-    "merge",
-    "--no-commit",
-    "--no-ff",
-    UPSTREAM_BRANCH,
-  ]);
-  if (result.ok) return true;
-
-  // Check for unresolved conflicts
-  const status = run(["git", "diff", "--name-only", "--diff-filter=U"]);
-  if (status.length > 0) {
-    console.error("[sync] merge conflict detected, aborting...");
-    runQuiet(["git", "merge", "--abort"]);
-    return false;
-  }
-
-  // Some other merge error — abort anyway
-  console.error("[sync] merge failed, aborting...");
-  runQuiet(["git", "merge", "--abort"]);
-  return false;
+function getCommitMessages(base: string, target: string): string[] {
+  const out = run(["git", "log", "--format=%h %s", `${base}..${target}`]);
+  return out.length > 0 ? out.split("\n") : [];
 }
 
-function getConflictFiles(): string[] {
-  const out = run(["git", "diff", "--name-only", "--diff-filter=U"]);
-  return out.length > 0 ? out.split("\n") : [];
+/* ─── merge with conflict guard ─── */
+
+function attemptMerge(branch: string): { ok: true } | { ok: false; reason: "conflict" | "other"; files: string[] } {
+  console.log(`[sync] merging ${UPSTREAM_BRANCH} into ${branch}...`);
+  const result = runQuiet(["git", "merge", "--no-commit", "--no-ff", UPSTREAM_BRANCH]);
+
+  if (result.ok) {
+    return { ok: true };
+  }
+
+  // Determine whether it's a conflict or something else
+  const conflicted = run(["git", "diff", "--name-only", "--diff-filter=U"]);
+  const files = conflicted.length > 0 ? conflicted.split("\n") : [];
+
+  if (files.length > 0) {
+    console.error("[sync] ❌ merge conflict detected — aborting merge!");
+    runQuiet(["git", "merge", "--abort"]);
+    return { ok: false, reason: "conflict", files };
+  }
+
+  console.error("[sync] ❌ merge failed for a non-conflict reason — aborting merge!");
+  runQuiet(["git", "merge", "--abort"]);
+  return { ok: false, reason: "other", files: [] };
+}
+
+/* ─── post-merge verification ─── */
+
+function verifyProtectedFiles(): string[] {
+  const missing: string[] = [];
+  for (const f of PROTECTED_FILES) {
+    const result = runQuiet(["git", "ls-files", "--error-unmatch", f]);
+    if (!result.ok) missing.push(f);
+  }
+  return missing;
+}
+
+function showMergeSummary(headBefore: string): void {
+  const changed = run(["git", "diff", "--name-only", `${headBefore}..HEAD`]);
+  if (changed.length > 0) {
+    console.log("[sync] changed files in this merge:");
+    for (const line of changed.split("\n").slice(0, 20)) {
+      console.log(`  · ${line}`);
+    }
+    const total = changed.split("\n").length;
+    if (total > 20) console.log(`  ... and ${total - 20} more`);
+  }
+}
+
+/* ─── validation steps ─── */
+
+function runInstallIfNeeded(): { ok: boolean; output: string } {
+  const changed = runQuiet(["git", "diff", "--name-only", "HEAD~1"]).stdout;
+  if (!changed.includes("pnpm-lock.yaml") && !changed.includes("package.json")) {
+    return { ok: true, output: "" };
+  }
+
+  console.log("[sync] dependency changes detected, running pnpm install...");
+  const result = spawnSync("pnpm", ["install"], {
+    encoding: "utf8",
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  return {
+    ok: result.status === 0,
+    output: (result.stdout ?? "") + (result.stderr ?? ""),
+  };
 }
 
 function runTypecheck(): { ok: boolean; output: string } {
@@ -133,18 +193,19 @@ function runTypecheck(): { ok: boolean; output: string } {
   };
 }
 
+/* ─── push ─── */
+
 function shouldPush(): boolean {
   const env = process.env.SYNC_UPSTREAM_PUSH;
   if (env === "1" || env === "true") return true;
-  // Non-interactive fallback: default to false
   if (!process.stdin.isTTY) return false;
 
-  const answer = run(["node", "-e", `
-    process.stdout.write("Push to origin? [y/N] ");
+  process.stdout.write("Push to origin? [y/N] ");
+  const buf = run(["node", "-e", `
     const buf = require("fs").readFileSync(0, { encoding: "utf8" });
-    process.stdout.write(buf.trim().toLowerCase().startsWith("y") ? "y\n" : "n\n");
+    process.stdout.write(buf.trim().toLowerCase().startsWith("y") ? "y" : "n");
   `]);
-  return answer.trim() === "y";
+  return buf.trim() === "y";
 }
 
 function pushOrigin(branch: string): void {
@@ -152,13 +213,15 @@ function pushOrigin(branch: string): void {
   run(["git", "push", "origin", branch]);
 }
 
+/* ─── main ─── */
+
 function main(): SyncResult {
   const branch = getCurrentBranch();
   console.log(`[sync] current branch: ${branch}`);
 
   if (hasUncommittedChanges()) {
-    console.error("[sync] abort: uncommitted changes detected. Commit or stash them first.");
-    process.exit(1);
+    console.error("[sync] ❌ abort: uncommitted changes detected. Commit or stash them first.");
+    return { kind: "dirty-worktree" };
   }
 
   ensureUpstreamRemote();
@@ -174,71 +237,108 @@ function main(): SyncResult {
     return { kind: "no-updates" };
   }
 
-  const merged = mergeUpstream(branch);
-  if (!merged) {
-    const files = getConflictFiles();
-    return { kind: "conflict", files };
+  // Show local-only commits so the user knows what they own
+  if (behind > 0) {
+    console.log(`[sync] ${behind} local-only commit(s) will be preserved:`);
+    for (const line of getCommitMessages(UPSTREAM_BRANCH, branch).slice(0, 10)) {
+      console.log(`  · ${line}`);
+    }
+    if (behind > 10) console.log(`  ... and ${behind - 10} more`);
   }
 
-  // Check if the merge actually changed anything
-  const mergeHead = runQuiet(["git", "rev-parse", "MERGE_HEAD"]);
-  if (!mergeHead.ok) {
-    // No MERGE_HEAD means fast-forward or nothing to merge
-    console.log("[sync] nothing to merge (already up to date or fast-forward).");
+  // Show what we're about to pull in
+  console.log(`[sync] ${ahead} upstream commit(s) to merge:`);
+  for (const line of getCommitMessages(branch, UPSTREAM_BRANCH).slice(0, 10)) {
+    console.log(`  · ${line}`);
+  }
+  if (ahead > 10) console.log(`  ... and ${ahead - 10} more`);
+
+  const headBefore = run(["git", "rev-parse", "HEAD"]);
+
+  const mergeResult = attemptMerge(branch);
+  if (!mergeResult.ok) {
+    return {
+      kind: "conflict",
+      files: mergeResult.files,
+    };
+  }
+
+  // Check if the merge actually introduced changes
+  const treeDiff = runQuiet(["git", "diff", "--cached", "--quiet"]);
+  if (treeDiff.ok) {
+    console.log("[sync] merge produced no changes (already up to date).");
+    runQuiet(["git", "merge", "--abort"]);
     return { kind: "no-updates" };
   }
 
   // Commit the merge
   const mergeCommitMsg = `chore: merge upstream/nexu-io/open-design main (${ahead} commits)`;
   run(["git", "commit", "-m", mergeCommitMsg]);
-  console.log(`[sync] merge committed: ${mergeCommitMsg}`);
+  console.log(`[sync] ✅ merge committed: ${mergeCommitMsg}`);
 
-  // Install dependencies if lockfile changed
-  const lockChanged = runQuiet(["git", "diff", "--name-only", "HEAD~1"]).stdout;
-  if (lockChanged.includes("pnpm-lock.yaml") || lockChanged.includes("package.json")) {
-    console.log("[sync] dependency changes detected, running pnpm install...");
-    const install = spawnSync("pnpm", ["install"], {
-      encoding: "utf8",
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    if (install.status !== 0) {
-      console.error("[sync] pnpm install failed.");
-      console.error((install.stderr ?? "").slice(-2000));
-      return { kind: "typecheck-failed", output: install.stderr ?? "" };
-    }
+  // Verify protected files weren't deleted
+  const missing = verifyProtectedFiles();
+  if (missing.length > 0) {
+    console.error("[sync] ❌ protected files missing after merge!");
+    for (const f of missing) console.error(`  ✗ ${f}`);
+    return { kind: "protected-file-missing", files: missing };
+  }
+  console.log("[sync] ✅ protected files verified.");
+
+  showMergeSummary(headBefore);
+
+  // Install dependencies if needed
+  const install = runInstallIfNeeded();
+  if (!install.ok) {
+    console.error("[sync] ❌ pnpm install failed.");
+    console.error(install.output.slice(-2000));
+    return { kind: "install-failed", output: install.output };
   }
 
-  // Validate
+  // Typecheck
   const typecheck = runTypecheck();
   if (!typecheck.ok) {
-    console.error("[sync] typecheck failed — please fix errors manually.");
+    console.error("[sync] ❌ typecheck failed — please fix errors manually.");
     console.error(typecheck.output.slice(-2000));
     return { kind: "typecheck-failed", output: typecheck.output };
   }
-  console.log("[sync] typecheck passed.");
+  console.log("[sync] ✅ typecheck passed.");
 
   if (shouldPush()) {
     pushOrigin(branch);
   } else {
-    console.log("[sync] skipped push. Run `git push origin ${branch}` manually when ready.");
+    console.log(`[sync] skipped push. Run \`git push origin ${branch}\` manually when ready.`);
   }
 
   return { kind: "success", commits: ahead };
 }
+
+/* ─── run ─── */
 
 const result = main();
 
 switch (result.kind) {
   case "no-updates":
     process.exit(0);
+  case "dirty-worktree":
+    process.exit(1);
   case "conflict":
-    console.error("[sync] conflicted files:");
-    for (const f of result.files) console.error(`  - ${f}`);
+    console.error("[sync] ❌ merge aborted due to conflict. Conflicted files:");
+    for (const f of result.files) console.error(`  · ${f}`);
+    console.error("[sync] resolve the conflicts manually, then commit the merge.");
     process.exit(2);
+  case "protected-file-missing":
+    console.error("[sync] ❌ merge aborted because protected files were deleted:");
+    for (const f of result.files) console.error(`  · ${f}`);
+    console.error("[sync] inspect the merge and restore these files before continuing.");
+    process.exit(4);
+  case "install-failed":
+    console.error("[sync] ❌ dependency installation failed.");
+    process.exit(5);
   case "typecheck-failed":
+    console.error("[sync] ❌ validation failed. fix errors and commit manually.");
     process.exit(3);
   case "success":
-    console.log(`[sync] successfully merged ${result.commits} upstream commit(s).`);
+    console.log(`[sync] ✅ successfully merged ${result.commits} upstream commit(s).`);
     process.exit(0);
 }
